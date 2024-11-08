@@ -35,11 +35,13 @@ class WebScraper:
         self.page = self.context.new_page()
 
     def is_valid_url(self, url):
-        """Check if URL belongs to the same domain and is allowed by robots.txt"""
-        parsed = urlparse(url)
-        is_same_domain = parsed.netloc == self.domain
-        is_allowed = self.rp.can_fetch(self.session.headers["User-Agent"], url)
-        return is_same_domain and is_allowed
+        """Check if URL is valid and belongs to the same domain"""
+        try:
+            parsed_url = urlparse(url)
+            base_domain = urlparse(self.base_url).netloc
+            return parsed_url.netloc == base_domain
+        except:
+            return False
 
     def get_links(self, soup, current_url):
         """Extract all links from a page"""
@@ -53,19 +55,37 @@ class WebScraper:
         return links
 
     def save_page(self, url, content):
-        """Save the page content to a file"""
-        parsed = urlparse(url)
-        path = parsed.path.strip("/")
-        if not path:
-            path = "index.html"
-
-        # Create directory structure
-        save_path = Path("scraped_site") / self.domain / path
-        # ic(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(save_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        """Save the scraped content to a file"""
+        try:
+            # Create directory structure based on URL
+            parsed_url = urlparse(url)
+            path_parts = parsed_url.path.strip('/').split('/')
+            if not path_parts[0]:
+                path_parts = ['index']
+            
+            # Create the directory
+            save_dir = Path('scraped_site') / parsed_url.netloc / '/'.join(path_parts[:-1])
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save content and links separately
+            content_file = save_dir / f"{path_parts[-1] or 'index'}.txt"
+            links_file = save_dir / f"{path_parts[-1] or 'index'}_document_links.json"
+            
+            # Save main content
+            content_file.write_text(content['content'], encoding='utf-8')
+            
+            # Save document links
+            links_file.write_text(
+                json.dumps(content['document_links'], 
+                          indent=2, 
+                          ensure_ascii=False),
+                encoding='utf-8'
+            )
+            
+            print(f"\n✓ Saved page content and links to {save_dir}")
+            
+        except Exception as e:
+            print(f"✗ Error saving page {url}: {str(e)}")
 
     def scrape(self):
         """Main scraping method"""
@@ -80,45 +100,73 @@ class WebScraper:
             print(f"Scraping: {url}")
 
             try:
-                # Navigate to the page
+                # Navigate and wait for content
                 self.page.goto(url, timeout=60000)
-                
-                # Handle cookie banner - look for common cookie accept buttons
-                try:
-                    # Wait for cookie banner with longer timeout
-                    self.page.wait_for_selector('button:has-text("Allow all"), button:has-text("Hyväksy")', timeout=10000)
-                    # Click accept button (try both English and Finnish)
-                    self.page.click('button:has-text("Accept"), button:has-text("Hyväksy")')
-                    # Wait for banner to disappear
-                    self.page.wait_for_timeout(2000)
-                except:
-                    print("No cookie banner found or already accepted")
-
-                # Wait for the main content to load
                 self.page.wait_for_load_state('networkidle', timeout=60000)
-                
-                # Additional wait to ensure JavaScript execution
                 self.page.wait_for_timeout(5000)
 
-                # Get the page content after cookie banner is handled
-                content = self.page.content()
-                
-                # Parse with BeautifulSoup
-                soup = BeautifulSoup(content, 'html.parser')
-                
-                # Extract all links
-                links = []
-                for a in soup.find_all('a', href=True):
-                    href = a['href']
-                    text = a.get_text(strip=True)
-                    if href and text:  # Only include links with both href and text
-                        links.append({
-                            'text': text,
-                            'url': urljoin(url, href)
-                        })
+                # Get the main page content
+                content = self.page.evaluate('''() => {
+                    const elements = document.querySelectorAll('script, style');
+                    elements.forEach(el => el.remove());
+                    return document.body.innerText;
+                }''')
 
-                # Save the links
-                self.save_page(url, json.dumps(links, indent=2, ensure_ascii=False))
+                # Extract document links
+                document_links = self.page.evaluate('''() => {
+                    const fileExtensions = ['.xlsx', '.xls', '.pdf', '.doc', '.docx'];
+                    return Array.from(document.querySelectorAll('a[href]'))
+                        .filter(a => fileExtensions.some(ext => a.href.toLowerCase().endsWith(ext)))
+                        .map(a => ({
+                            text: a.innerText.trim(),
+                            url: a.href,
+                            type: a.href.split('.').pop().toLowerCase()
+                        }))
+                        .filter(link => link.text);
+                }''')
+
+                if document_links:
+                    print(f"\nFound {len(document_links)} documents:")
+                    for link in document_links:
+                        try:
+                            # Create directory for the file type if it doesn't exist
+                            file_dir = Path('downloaded_files') / link['type']
+                            file_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Clean filename
+                            clean_filename = "".join(c for c in link['text'] if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                            file_path = file_dir / f"{clean_filename}.{link['type']}"
+                            
+                            # Download only if file doesn't exist
+                            if not file_path.exists():
+                                print(f"\nDownloading: {link['text']}")
+                                response = requests.get(link['url'], timeout=30)
+                                if response.status_code == 200:
+                                    file_path.write_bytes(response.content)
+                                    print(f"✓ Saved to: {file_path}")
+                                else:
+                                    print(f"✗ Failed to download: HTTP {response.status_code}")
+                            else:
+                                print(f"• Skipped (already exists): {file_path}")
+                                
+                        except Exception as e:
+                            print(f"✗ Error downloading {link['url']}: {str(e)}")
+                            continue
+
+                # Save the webpage content and document links
+                self.save_page(url, {
+                    'content': content,
+                    'document_links': document_links
+                })
+
+                # Find new links for crawling
+                new_links = self.page.evaluate('''() => {
+                    return Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.href)
+                        .filter(href => href.startsWith('http'));
+                }''')
+                urls_to_visit.update(set(new_links) - self.visited_urls)
+
                 self.visited_urls.add(url)
 
             except Exception as e:
