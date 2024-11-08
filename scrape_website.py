@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from urllib import robotparser
 from playwright.sync_api import sync_playwright
+from icecream import ic
+import json
 
 
 
@@ -59,6 +61,7 @@ class WebScraper:
 
         # Create directory structure
         save_path = Path("scraped_site") / self.domain / path
+        # ic(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(save_path, "w", encoding="utf-8") as f:
@@ -77,63 +80,52 @@ class WebScraper:
             print(f"Scraping: {url}")
 
             try:
-                # Respect crawl delay
-                time.sleep(self.delay)
-
-                # Navigate to the page and wait for content to load
-                self.page.goto(url)
-                self.page.wait_for_load_state('networkidle')
+                # Navigate to the page
+                self.page.goto(url, timeout=60000)
                 
-                # Print out all available selectors for debugging
-                selectors = self.page.evaluate('''() => {
-                    return Array.from(document.querySelectorAll('*'))
-                        .map(el => {
-                            let selector = el.tagName.toLowerCase();
-                            if (el.id) selector += '#' + el.id;
-                            if (el.className && typeof el.className === 'string') {
-                                selector += '.' + el.className.split(' ').join('.');
-                            }
-                            return selector;
+                # Handle cookie banner - look for common cookie accept buttons
+                try:
+                    # Wait for cookie banner with longer timeout
+                    self.page.wait_for_selector('button:has-text("Allow all"), button:has-text("Hyväksy")', timeout=10000)
+                    # Click accept button (try both English and Finnish)
+                    self.page.click('button:has-text("Accept"), button:has-text("Hyväksy")')
+                    # Wait for banner to disappear
+                    self.page.wait_for_timeout(2000)
+                except:
+                    print("No cookie banner found or already accepted")
+
+                # Wait for the main content to load
+                self.page.wait_for_load_state('networkidle', timeout=60000)
+                
+                # Additional wait to ensure JavaScript execution
+                self.page.wait_for_timeout(5000)
+
+                # Get the page content after cookie banner is handled
+                content = self.page.content()
+                
+                # Parse with BeautifulSoup
+                soup = BeautifulSoup(content, 'html.parser')
+                
+                # Extract all links
+                links = []
+                for a in soup.find_all('a', href=True):
+                    href = a['href']
+                    text = a.get_text(strip=True)
+                    if href and text:  # Only include links with both href and text
+                        links.append({
+                            'text': text,
+                            'url': urljoin(url, href)
                         })
-                        .join('\\n');
-                }''')
-                print("Available selectors:", selectors)
 
-                # Get the main content
-                content = self.page.evaluate('''() => {
-                    // Try to find the main content
-                    const article = document.querySelector('article');
-                    if (article) return article.innerText;
-                    
-                    const main = document.querySelector('main');
-                    if (main) return main.innerText;
-                    
-                    // If no specific content container found, get the body text
-                    return document.body.innerText;
-                }''')
-
-                if content:
-                    # Save the page with content
-                    self.save_page(url, content)
-
-                    # Find new links using Playwright
-                    links = self.page.evaluate('''() => {
-                        return Array.from(document.querySelectorAll('a'))
-                            .map(a => a.href)
-                            .filter(href => href);
-                    }''')
-                    
-                    new_links = {link for link in links if self.is_valid_url(link)}
-                    urls_to_visit.update(new_links - self.visited_urls)
-                
+                # Save the links
+                self.save_page(url, json.dumps(links, indent=2, ensure_ascii=False))
                 self.visited_urls.add(url)
 
             except Exception as e:
                 print(f"Error scraping {url}: {e}")
                 continue
 
-    def __del__(self):
-        # Clean up Playwright resources
+        # Clean up
         self.browser.close()
         self.playwright.stop()
 
