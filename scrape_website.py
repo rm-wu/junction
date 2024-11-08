@@ -28,7 +28,7 @@ class WebScraper:
             print("Could not read robots.txt")
 
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch()
+        self.browser = self.playwright.chromium.launch(headless=True)
         self.context = self.browser.new_context()
         self.page = self.context.new_page()
 
@@ -80,22 +80,53 @@ class WebScraper:
                 # Respect crawl delay
                 time.sleep(self.delay)
 
-                # Use Playwright instead of requests
+                # Navigate to the page and wait for content to load
                 self.page.goto(url)
                 self.page.wait_for_load_state('networkidle')
-                content = self.page.content()
+                
+                # Print out all available selectors for debugging
+                selectors = self.page.evaluate('''() => {
+                    return Array.from(document.querySelectorAll('*'))
+                        .map(el => {
+                            let selector = el.tagName.toLowerCase();
+                            if (el.id) selector += '#' + el.id;
+                            if (el.className && typeof el.className === 'string') {
+                                selector += '.' + el.className.split(' ').join('.');
+                            }
+                            return selector;
+                        })
+                        .join('\\n');
+                }''')
+                print("Available selectors:", selectors)
 
+                # Get the main content
+                content = self.page.evaluate('''() => {
+                    // Try to find the main content
+                    const article = document.querySelector('article');
+                    if (article) return article.innerText;
+                    
+                    const main = document.querySelector('main');
+                    if (main) return main.innerText;
+                    
+                    // If no specific content container found, get the body text
+                    return document.body.innerText;
+                }''')
+
+                if content:
+                    # Save the page with content
+                    self.save_page(url, content)
+
+                    # Find new links using Playwright
+                    links = self.page.evaluate('''() => {
+                        return Array.from(document.querySelectorAll('a'))
+                            .map(a => a.href)
+                            .filter(href => href);
+                    }''')
+                    
+                    new_links = {link for link in links if self.is_valid_url(link)}
+                    urls_to_visit.update(new_links - self.visited_urls)
+                
                 self.visited_urls.add(url)
-
-                # Parse the page content
-                soup = BeautifulSoup(content, "html.parser")
-
-                # Save the page
-                self.save_page(url, content)
-
-                # Find new links
-                new_links = self.get_links(soup, url)
-                urls_to_visit.update(new_links - self.visited_urls)
 
             except Exception as e:
                 print(f"Error scraping {url}: {e}")
